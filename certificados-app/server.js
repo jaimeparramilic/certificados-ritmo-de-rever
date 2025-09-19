@@ -28,6 +28,8 @@ app.use(cookieParser());
 // Servir archivos estáticos (CSS, JS, imágenes, etc.) desde la carpeta 'public'
 app.use(express.static(path.join(process.cwd(), 'public')));
 
+app.use('/assets', express.static(path.join(process.cwd(), 'assets')));
+
 // ---------- HELPERS ----------
 const isValidShop = (shop) =>
   /^[a-zA-Z0-9][a-zA-Z0-9-]*\.myshopify\.com$/.test(String(shop || ''));

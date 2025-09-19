@@ -35,9 +35,6 @@ build/
 coverage/
 *.tgz
 
-# Certificados generados (si los guardas localmente)
-/certificados-generados/
-*.pdf
 
 # Archivos de caché
 .npm/
