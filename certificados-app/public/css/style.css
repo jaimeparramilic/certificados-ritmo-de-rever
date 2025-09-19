@@ -1,0 +1,61 @@
+body {
+    font-family: 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';
+    color: #343a40; /* Color de texto base oscuro */
+    background-color: #f8f9fa !important; /* Fondo claro general */
+}
+
+.card {
+    border-radius: 1rem;
+    border: 1px solid #dee2e6; /* Borde sutil para la tarjeta */
+    background-color: #ffffff;
+}
+
+.card-title.h3 {
+    font-weight: 700;
+    color: #212529 !important; /* Títulos más oscuros */
+}
+
+.form-label {
+    font-weight: 500;
+    color: #495057;
+}
+
+.form-control {
+    border-color: #ced4da;
+}
+
+.btn-dark {
+    background-color: #212529; /* Botón oscuro principal */
+    border-color: #212529;
+    transition: all 0.3s ease;
+}
+
+.btn-dark:hover {
+    background-color: #343a40; /* Un poco más claro al pasar el mouse */
+    border-color: #343a40;
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(33, 37, 41, 0.2);
+}
+
+.lead {
+    color: #6c757d !important; /* Texto secundario */
+}
+
+.text-dark {
+    color: #212529 !important;
+}
+
+.text-secondary {
+    color: #6c757d !important;
+}
+
+.text-muted {
+    color: #6c757d !important; /* También para el copyright */
+}
+
+/* Pequeño ajuste para centrar la tarjeta verticalmente en pantallas muy grandes */
+@media (min-height: 700px) {
+    body.d-flex {
+        align-items: center;
+    }
+}

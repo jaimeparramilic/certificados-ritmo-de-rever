@@ -1,0 +1,46 @@
+# Dependencias y Logs
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Archivos de entorno
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.*.local
+.env.example
+
+# Archivos de sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Archivos temporales de editor de código
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Archivos de build y paquetes
+dist/
+build/
+coverage/
+*.tgz
+
+# Certificados generados (si los guardas localmente)
+/certificados-generados/
+*.pdf
+
+# Archivos de caché
+.npm/
+.yarn/cache
+.yarn/unplugged
+.yarn/install-state.gz

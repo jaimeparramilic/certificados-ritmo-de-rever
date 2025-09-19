@@ -1,425 +1,287 @@
-// server.js — Certificados directo a Shopify con auto-instalación OFFLINE
-// y redirección a host canónico para evitar fallas de cookie en OAuth.
-
-import path from 'path';
-import fs from 'fs';
-import { fileURLToPath } from 'url';
-import dotenv from 'dotenv';
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-dotenv.config({ path: path.join(__dirname, '.env') });
-
+// server.js — App de certificados usando la app principal para consultar órdenes
 import express from 'express';
 import cookieParser from 'cookie-parser';
-import crypto from 'crypto';
+import dotenv from 'dotenv';
+import path from 'path';
+import fs from 'fs';
 import PDFDocument from 'pdfkit';
-import QRCode from 'qrcode';
+import fetch from 'node-fetch';
+import sizeOf from 'image-size';
 
-import '@shopify/shopify-api/adapters/node';
-import { shopifyApi, LATEST_API_VERSION, LogSeverity } from '@shopify/shopify-api';
-import { SQLiteSessionStorage } from '@shopify/shopify-app-session-storage-sqlite';
+dotenv.config({ path: path.join(process.cwd(), '.env') });
 
-// ---------- ENV ----------
-const PORT   = Number(process.env.PORT || 3001);
-const BRAND  = process.env.BRAND_NAME || 'Ritmo de Rever';
-const VERIFY_BASE = (process.env.VERIFY_BASE || '').replace(/\/$/, '') || 'https://example.com';
-
-const APP_HOST_RAW = (process.env.SHOPIFY_APP_HOST || '').trim().replace(/\/+$/, '');
-const HOST_NAME = APP_HOST_RAW.replace(/^https?:\/\//, '');
-const HOST_SCHEME = APP_HOST_RAW.startsWith('https') ? 'https' : 'http';
-
+// ---------- CONFIG ----------
+const PORT = Number(process.env.PORT || 3001);
+const BRAND = process.env.BRAND_NAME || 'RITMODEREVER';
 const DEFAULT_SHOP = process.env.DEFAULT_SHOP || '';
-const SCOPES = (process.env.SHOPIFY_SCOPES || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+const APP_PRINCIPAL_URL = process.env.SHOPIFY_APP_URL;
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
 
-const DB_PATH = (process.env.SESSION_DB_PATH || './tmp/shopify_sessions.sqlite').trim();
-fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-const sessionStorage = new SQLiteSessionStorage(DB_PATH);
-
-const shopify = shopifyApi({
-  apiKey: process.env.SHOPIFY_API_KEY,
-  apiSecretKey: process.env.SHOPIFY_API_SECRET,
-  scopes: SCOPES,
-  apiVersion: process.env.SHOPIFY_API_VERSION || LATEST_API_VERSION,
-  isEmbeddedApp: false,
-  hostName: HOST_NAME,
-  hostScheme: HOST_SCHEME,
-  sessionStorage,
-  logger: { level: LogSeverity.Info },
-});
-
-console.log('[SHOPIFY CONFIG]', {
-  APP_HOST_RAW, HOST_NAME,
-  hasKey: !!process.env.SHOPIFY_API_KEY,
-  hasSecret: !!process.env.SHOPIFY_API_SECRET,
-  scopes: SCOPES,
-  dbPath: DB_PATH,
-  defaultShop: DEFAULT_SHOP,
-});
+if (!APP_PRINCIPAL_URL) throw new Error('Debe definir SHOPIFY_APP_URL en .env');
+if (!INTERNAL_API_KEY) throw new Error('Debe definir INTERNAL_API_KEY en .env');
 
 const app = express();
-app.set('trust proxy', true);
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(cookieParser());
 
-// ---------- Redirección a host canónico ----------
-app.use((req, res, next) => {
-  const expectedHost = HOST_NAME;     // derivado de SHOPIFY_APP_HOST
-  const expectedScheme = HOST_SCHEME; // 'https' o 'http'
-  if (expectedHost && req.headers.host !== expectedHost) {
-    const to = `${expectedScheme}://${expectedHost}${req.originalUrl}`;
-    return res.redirect(301, to);
-  }
-  next();
-});
+// Servir archivos estáticos (CSS, JS, imágenes, etc.) desde la carpeta 'public'
+app.use(express.static(path.join(process.cwd(), 'public')));
 
-// ---------- Helpers ----------
-const isValidShop = (shop) => /^[a-zA-Z0-9][a-zA-Z0-9-]*\.myshopify\.com$/.test(String(shop||''));
-const detectShop = (req) => (req.query.shop || req.body?.shop || DEFAULT_SHOP || '').toString();
+// ---------- HELPERS ----------
+const isValidShop = (shop) =>
+  /^[a-zA-Z0-9][a-zA-Z0-9-]*\.myshopify\.com$/.test(String(shop || ''));
 
-function setReturnToCookie(res, url) {
-  const isHttps = HOST_SCHEME === 'https';
-  res.cookie('return_to', url || '/', {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: isHttps,
-    path: '/',
-    maxAge: 5 * 60 * 1000,
+// Consulta a la app principal para obtener los datos de la orden
+async function fetchOrderFromAppPrincipal(shop, orderName) {
+  if (!shop || !orderName) throw new Error('shop y orderName son requeridos');
+  const url = new URL('/api/order-data', APP_PRINCIPAL_URL);
+  url.searchParams.set('shop', shop);
+  url.searchParams.set('order_name', orderName);
+
+  const resp = await fetch(url.toString(), {
+    headers: { 'Authorization': INTERNAL_API_KEY },
   });
-}
-function popReturnToCookie(req, res) {
-  const v = req.cookies?.return_to || '/';
-  res.clearCookie('return_to', { path: '/' });
-  return v;
-}
-
-// Si hay offline la devuelve; si no, inicia OAuth y devuelve null (ya respondió).
-async function getOrInstallOfflineSession(req, res) {
-  const shop = detectShop(req);
-  if (!isValidShop(shop)) {
-    res.status(400).send('Configura DEFAULT_SHOP o pasa ?shop=xxx.myshopify.com');
-    return null;
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Error al consultar app principal: ${resp.status} ${text}`);
   }
-  const offlineId = shopify.session.getOfflineId(shop);
-  const session = await shopify.config.sessionStorage.loadSession(offlineId);
-  if (session) return session;
-
-  setReturnToCookie(res, req.originalUrl || '/');
-  await shopify.auth.begin({
-    shop,
-    callbackPath: '/shopify/auth/offline/callback',
-    isOnline: false,
-    rawRequest: req,
-    rawResponse: res,
-  });
-  return null;
-}
-
-// Código determinístico de certificado
-function genCode({ orderId, lineItemId, unitIndex }) {
-  const raw = `${orderId}|${lineItemId}|${unitIndex}`;
-  return 'RR-' + crypto.createHash('sha256').update(raw).digest('hex').slice(0, 10).toUpperCase();
-}
-
-// Trae la orden con imágenes (GraphQL)
-async function fetchOrderWithImages(session, { orderId, orderName }) {
-  const gql = new shopify.clients.Graphql({ session });
-
-  let gid = null;
-  if (orderId) {
-    gid = String(orderId).startsWith('gid://') ? String(orderId) : `gid://shopify/Order/${orderId}`;
-  } else if (orderName) {
-    const r = await gql.query({
-      data: {
-        query: `query($q:String!){ orders(first:1, query:$q){ edges{ node{ id } } } }`,
-        variables: { q: `name:${orderName}` },
-      },
-    });
-    gid = r?.body?.data?.orders?.edges?.[0]?.node?.id || null;
-  }
-  if (!gid) throw new Error('No se pudo resolver el ID de la orden');
-
-  const data = await gql.query({
-    data: {
-      query: `
-        query($id:ID!){
-          order(id:$id){
-            id name createdAt currencyCode
-            lineItems(first:100){
-              edges{
-                node{
-                  id title sku quantity
-                  variant{
-                    id
-                    image{ url }
-                    product{ featuredImage{ url } }
-                  }
-                }
-              }
-            }
-          }
-        }`,
-      variables: { id: gid },
-    },
-  });
-
-  const order = data?.body?.data?.order;
-  if (!order) throw new Error('Orden no encontrada');
-  return order;
+  const data = await resp.json();
+  if (!data.ok || !data.data) throw new Error('No se obtuvo la orden desde la app principal');
+  return data.data;
 }
 
 async function fetchImageBuffer(url) {
   if (!url) return null;
   try {
-    const r = await fetch(url, { headers: { 'Accept': 'image/avif,image/webp,image/*,*/*' } });
+    const r = await fetch(url);
     if (!r.ok) return null;
-    const ct = (r.headers.get('content-type') || '').toLowerCase();
-    if (!ct.includes('jpeg') && !ct.includes('jpg') && !ct.includes('png')) return null; // PDFKit soporta JPG/PNG
-    return Buffer.from(await r.arrayBuffer());
-  } catch {
+    const ab = await r.arrayBuffer();
+    return Buffer.from(ab);
+  } catch (e) {
+    console.warn('Error fetch image:', e.message);
     return null;
   }
 }
 
-async function drawCertPage({ doc, brand, orderName, code, title, sku, unitIndex, titular, imageUrl }) {
-  // Marco
-  doc.rect(20, 20, doc.page.width - 40, doc.page.height - 40).lineWidth(1.2).strokeColor('#C6C6C6').stroke();
+async function drawCertPage({ doc, titular, order }) {
+  const headerPath = path.join(process.cwd(), 'assets', 'header.png');
+  const footerPath = path.join(process.cwd(), 'assets', 'footer.png');
+  const signaturePath = path.join(process.cwd(), 'assets', 'firma.png');
 
-  // Encabezado
-  doc.fontSize(12).fillColor('#6B7280').text(brand, { align: 'center' });
-  doc.moveDown(0.2);
-  doc.fontSize(22).fillColor('#111827').text('CERTIFICADO DE AUTENTICIDAD', { align: 'center' });
-  doc.moveDown(0.2);
-  doc.fontSize(10).fillColor('#4B5563').text(`Orden: ${orderName} · Código: ${code}`, { align: 'center' });
-
-  const bodyX = 60, bodyW = doc.page.width - bodyX*2;
-  doc.moveDown(1);
-  doc.fontSize(12).fillColor('#111827')
-     .text('Se certifica que la siguiente pieza pertenece a la colección:', bodyX, 200, { width: bodyW, align: 'center' });
-  doc.moveDown(0.4);
-  doc.fontSize(18).text(`“${title || ''}”`, { width: bodyW, align: 'center' });
-  doc.moveDown(0.2);
-  doc.fontSize(12).text(`SKU: ${sku || '-'}`, { width: bodyW, align: 'center' });
-  doc.moveDown(0.2);
-  doc.text(`Pieza / Unidad: ${unitIndex}`, { width: bodyW, align: 'center' });
-  if (titular) { doc.moveDown(0.4); doc.text(`Titular: ${titular}`, { width: bodyW, align: 'center' }); }
-
-  // Imagen
-  const imgBuf = await fetchImageBuffer(imageUrl);
-  const imgW = 360, imgH = 260;
-  const imgX = (doc.page.width - imgW) / 2;
-  const imgY = 340;
-  doc.rect(imgX, imgY, imgW, imgH).strokeColor('#D1D5DB').lineWidth(0.8).stroke();
-  if (imgBuf) {
-    try { doc.image(imgBuf, imgX, imgY, { fit: [imgW, imgH], align: 'center', valign: 'center' }); } catch {}
-  } else {
-    doc.fontSize(10).fillColor('#6B7280').text('Imagen no disponible o formato no soportado', imgX, imgY + imgH/2 - 6, { width: imgW, align: 'center' });
+  if (fs.existsSync(headerPath)) {
+    doc.image(headerPath, 0, 0, { width: doc.page.width });
+  }
+  if (fs.existsSync(footerPath)) {
+    doc.image(footerPath, 0, doc.page.height - 80, { width: doc.page.width, height: 80 });
   }
 
-  // QR
-  const verifyUrl = `${VERIFY_BASE}/certificados?code=${encodeURIComponent(code)}`;
-  const qrBuf = await QRCode.toBuffer(verifyUrl, { margin: 0, scale: 6 });
-  const qrSize = 120, qrX = (doc.page.width - qrSize)/2, qrY = imgY + imgH + 16;
-  doc.image(qrBuf, qrX, qrY, { width: qrSize, height: qrSize });
-  doc.fontSize(9).fillColor('#6B7280').text(verifyUrl, 50, qrY + qrSize + 6, { width: doc.page.width-100, align: 'center' });
+  doc.y = 140;
 
-  // Firmas
-  const ySign = 720, col1 = 90, col2 = doc.page.width - 290;
-  doc.moveTo(col1, ySign).lineTo(col1+200, ySign).strokeColor('#9CA3AF').lineWidth(0.8).stroke();
-  doc.fontSize(10).fillColor('#4B5563').text('Dirección de Arte', col1, ySign + 6, { width: 200, align: 'center' });
-  doc.moveTo(col2, ySign).lineTo(col2+200, ySign).strokeColor('#9CA3AF').lineWidth(0.8).stroke();
-  doc.fontSize(10).fillColor('#4B5563').text('Curaduría', col2, ySign + 6, { width: 200, align: 'center' });
+  doc.font('Helvetica-Bold').fontSize(28).fillColor('#2c3e50')
+    .text('CERTIFICADO DE AUTENTICIDAD', { align: 'center' });
+  doc.moveDown(2);
+
+  doc.font('Helvetica').fontSize(15).fillColor('#34495e')
+    .text(`Se certifica la autenticidad de:`, { align: 'center' });
+  doc.moveDown(1);
+  
+  const lineItem = order?.lineItems?.edges?.[0]?.node;
+  const productName = lineItem?.title || 'Producto sin título';
+  doc.font('Helvetica-Bold').fontSize(22).fillColor('#111827')
+    .text(productName, { align: 'center' });
+  doc.moveDown(1.5);
+  
+  doc.font('Helvetica').fontSize(14).fillColor('#5c6a78')
+    .text(`A nombre de: ${titular}`, { align: 'center' });
+  doc.moveDown(3);
+
+  const imageY = doc.y;
+
+  if (lineItem && lineItem.variant?.image?.url) {
+    const productImageUrl = lineItem.variant.image.url;
+    const imgBuf = await fetchImageBuffer(productImageUrl);
+
+    if (imgBuf) {
+      try {
+        const fixedHeight = 100;
+        
+        const dimensions = sizeOf(imgBuf);
+        
+        // --- SALVAGUARDA CONTRA ERRORES ---
+        // Se comprueba que las dimensiones sean válidas antes de calcular.
+        if (dimensions && dimensions.width && dimensions.height > 0) {
+            const scaledWidth = dimensions.width * (fixedHeight / dimensions.height);
+            const xPos = (doc.page.width - scaledWidth) / 2;
+            
+            doc.image(imgBuf, xPos, imageY, { height: fixedHeight });
+            doc.y = imageY + fixedHeight;
+        } else {
+            throw new Error('Dimensiones de imagen inválidas.');
+        }
+
+      } catch (e) {
+        doc.y = imageY;
+        console.warn('Error al dibujar la imagen:', e.message);
+        doc.fontSize(10).fillColor('#e74c3c').text('Error al cargar la imagen del producto.', { align: 'center' });
+        doc.y += 20; // Añade espacio para que el error sea visible.
+      }
+    } else {
+        doc.fontSize(10).fillColor('#e74c3c').text('No se pudo cargar el buffer de la imagen.', { align: 'center' });
+    }
+  } else {
+      doc.fontSize(10).fillColor('#e74c3c').text('No hay imagen de producto disponible.', { align: 'center' });
+  }
+  
+  doc.moveDown(3);
+
+  doc.font('Helvetica').fontSize(12).fillColor('#34495e')
+    .text(`Artista: Juliana Revelo`, { align: 'center' });
+  doc.moveDown(0.5);
+  doc.text(`Fecha de emisión: ${new Date().toLocaleDateString('es-ES', { day: 'numeric', month: 'long', year: 'numeric' })}`, { align: 'center' });
+
+  const signatureBlockY = doc.page.height - 190;
+  const signatureImageHeight = 50;
+  const spaceBetween = 8;
+
+  if (fs.existsSync(signaturePath)) {
+    try {
+      const signatureWidth = 150;
+      const signatureX = (doc.page.width - signatureWidth) / 2;
+
+      doc.image(signaturePath, signatureX, signatureBlockY, {
+        width: signatureWidth,
+        height: signatureImageHeight,
+      });
+
+      const nameY = signatureBlockY + signatureImageHeight + spaceBetween;
+      doc.y = nameY;
+
+      doc.font('Helvetica-Bold').fontSize(12).fillColor('#2c3e50')
+         .text('Juliana Revelo', { align: 'center' });
+    } catch (e) {
+      doc.y = signatureBlockY;
+      console.warn('Error al dibujar la firma:', e.message);
+      doc.fontSize(10).fillColor('#e74c3c').text('Error al cargar la firma.', { align: 'center' });
+    }
+  }
 }
 
-// ---------- OAuth OFFLINE ----------
-app.get('/shopify/auth/offline', async (req, res) => {
-  try {
-    const shop = detectShop(req);
-    if (!isValidShop(shop)) return res.status(400).send('Missing or invalid ?shop=xxx.myshopify.com');
-    setReturnToCookie(res, req.get('referer') || '/');
-    await shopify.auth.begin({
-      shop,
-      callbackPath: '/shopify/auth/offline/callback',
-      isOnline: false,
-      rawRequest: req,
-      rawResponse: res,
-    });
-  } catch (e) {
-    console.error('OFFLINE AUTH BEGIN ERROR:', e);
-    res.status(500).send('Offline auth start failed: ' + (e?.message || e));
-  }
-});
 
-app.get('/shopify/auth/offline/callback', async (req, res) => {
-  try {
-    const { session } = await shopify.auth.callback({ rawRequest: req, rawResponse: res });
-    await shopify.config.sessionStorage.storeSession(session);
-    const back = popReturnToCookie(req, res);
-    res.redirect(back || '/');
-  } catch (e) {
-    console.error('OFFLINE AUTH CALLBACK ERROR:', e);
-    res.status(400).send('Offline auth callback failed: ' + (e?.message || e));
-  }
-});
-
-// ---------- UI ----------
+// ---------- RUTAS ----------
 app.get('/', (_req, res) => {
-  res.type('html').send(`<!doctype html>
-<html lang="es"><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>${BRAND} — Generar certificados</title>
-<style>
-  :root{ color-scheme: light dark }
-  body{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
-  .card{ max-width: 760px; margin: 0 auto; border:1px solid #ddd; border-radius: 16px; padding: 18px; }
-  input,button{ padding:10px; border-radius:10px; border:1px solid #ccc; width:100%; }
-  label{ font-size: 13px; color:#666 }
-  .row{ display:grid; grid-template-columns: 1fr; gap:10px; margin:10px 0; }
-  @media (min-width: 640px){ .row-2{ grid-template-columns: 1fr 1fr } }
-  .btn{ background:#111; color:#fff; cursor:pointer }
-  .muted{ color:#666; font-size: 13px }
-</style>
-<div class="card">
-  <h1 class="h4">Generar certificados (PDF) por orden</h1>
-  <p class="muted">Ingresa el número de orden (ej. <b>#1001</b>) y el <b>nombre del titular</b> que debe aparecer.</p>
-  <form method="POST" action="/generate">
-    <div class="row">
-      <div>
-        <label>Número de orden</label>
-        <input name="order_name" placeholder="#1001" required />
-      </div>
-      <div>
-        <label>Nombre del titular</label>
-        <input name="titular" placeholder="Nombre Apellido" required />
-      </div>
-    </div>
-    <div class="row">
-      <button class="btn" type="submit">Generar PDF</button>
-    </div>
-    <p class="muted">Si es la primera vez, te pediremos conectar la tienda <b>${DEFAULT_SHOP || '(definir DEFAULT_SHOP)'}</b> y volverás aquí automáticamente.</p>
-  </form>
-</div>
-</html>`);
+  res.type('html').send(`
+    <!doctype html>
+    <html lang="es">
+    <head>
+        <meta charset="utf-8"/>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>${BRAND} — Generar Certificados</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+        <link rel="stylesheet" href="/css/style.css">
+    </head>
+    <body class="bg-light">
+        <div class="container py-5">
+            <div class="card shadow-lg p-4 p-md-5 mx-auto" style="max-width: 600px;">
+                <div class="text-center mb-4">
+                    <img src="assets/logo-ritmoderever.png" alt="${BRAND} Logo" class="img-fluid mb-3" style="max-height: 80px;">
+                    <h1 class="card-title h3 mb-3 text-dark">${BRAND}</h1>
+                    <p class="lead text-secondary">Generador de Certificados</p>
+                </div>
+                <form method="POST" action="/generate">
+                    <div class="mb-3">
+                        <label for="order_name" class="form-label">Número de orden:</label>
+                        <input type="text" class="form-control" id="order_name" name="order_name" placeholder="Ej: #12345" required>
+                    </div>
+                    <div class="mb-4">
+                        <label for="titular" class="form-label">Nombre del titular:</label>
+                        <input type="text" class="form-control" id="titular" name="titular" placeholder="Ej: Juan Pérez" required>
+                    </div>
+                    <div class="d-grid gap-2">
+                        <button type="submit" class="btn btn-dark btn-lg">Generar PDF</button>
+                    </div>
+                </form>
+            </div>
+            <p class="text-center text-muted mt-4">
+                &copy; ${new Date().getFullYear()} ${BRAND}. Todos los derechos reservados.
+            </p>
+        </div>
+
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
+        <script src="/js/scripts.js"></script>
+    </body>
+    </html>
+  `);
 });
 
-// ---------- Generar PDF ----------
 app.post('/generate', async (req, res) => {
   try {
-    const session = await getOrInstallOfflineSession(req, res);
-    if (!session) return;
-
-    let orderName = String(req.body?.order_name || '').trim();
+    const shop = req.body.shop || DEFAULT_SHOP;
+    const orderName = String(req.body?.order_name || '').trim();
     const titular = String(req.body?.titular || '').trim();
-    if (!orderName) return res.status(400).send('Falta order_name');
-    if (!titular)   return res.status(400).send('Falta titular');
-    if (!orderName.startsWith('#')) orderName = '#' + orderName;
-
-    const order = await fetchOrderWithImages(session, { orderName });
-
-    const safeName = String(order.name || 'orden').replace(/[^a-z0-9]+/gi, '-');
-    const fname = `Certificados-${safeName}.pdf`;
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
-
-    const doc = new PDFDocument({ size: 'A4', margin: 50 });
-    doc.pipe(res);
-
-    let firstPage = true;
-    for (const edge of (order.lineItems?.edges || [])) {
-      const li = edge.node;
-      const img = li?.variant?.image?.url || li?.variant?.product?.featuredImage?.url || null;
-      const qty = Math.max(1, Number(li.quantity || 1));
-      for (let i = 1; i <= qty; i++) {
-        const code = genCode({ orderId: order.id, lineItemId: li.id, unitIndex: i });
-        if (!firstPage) doc.addPage();
-        await drawCertPage({
-          doc,
-          brand: BRAND,
-          orderName: order.name,
-          code,
-          title: li.title,
-          sku: li.sku || '',
-          unitIndex: i,
-          titular,
-          imageUrl: img,
-        });
-        firstPage = false;
-      }
+    if (!orderName || !titular) {
+      // Redirigir o mostrar un mensaje de error más amigable con Bootstrap
+      return res.status(400).send(`
+        <!doctype html>
+        <html lang="es">
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>${BRAND} — Error</title>
+            <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+            <link rel="stylesheet" href="/css/style.css">
+        </head>
+        <body class="bg-light d-flex align-items-center justify-content-center" style="min-height: 100vh;">
+            <div class="card shadow-lg p-4 p-md-5 mx-auto text-center" style="max-width: 500px;">
+                <img src="/assets/logo-ritmoderever.png" alt="${BRAND} Logo" class="img-fluid mb-3" style="max-height: 60px;">
+                <h2 class="card-title h4 mb-3 text-dark">Error al generar certificado</h2>
+                <p class="card-text text-secondary">Faltan datos en el formulario. Por favor, asegúrate de llenar todos los campos.</p>
+                <a href="/" class="btn btn-dark mt-3">Volver al inicio</a>
+            </div>
+            <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
+        </body>
+        </html>
+      `);
     }
 
+    // --- Consulta la app principal ---
+    const order = await fetchOrderFromAppPrincipal(shop, orderName);
+
+    const safeName = (order?.name ?? orderName).replace(/[^a-z0-9]+/gi, '-');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="Certificado-${safeName}.pdf"`);
+
+    const doc = new PDFDocument({ size: 'A4', margin: 0 }); // Margen 0 para controlar el diseño manualmente
+    doc.pipe(res);
+    await drawCertPage({ doc, titular, order });
     doc.end();
   } catch (e) {
     console.error('[POST /generate] error:', e);
-    res.status(e.status || 500).send('Error: ' + (e?.message || e));
+    // Mostrar un mensaje de error más amigable con Bootstrap
+    res.status(500).send(`
+      <!doctype html>
+      <html lang="es">
+      <head>
+          <meta charset="utf-8"/>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>${BRAND} — Error</title>
+          <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+          <link rel="stylesheet" href="/css/style.css">
+      </head>
+      <body class="bg-light d-flex align-items-center justify-content-center" style="min-height: 100vh;">
+          <div class="card shadow-lg p-4 p-md-5 mx-auto text-center" style="max-width: 500px;">
+              <img src="/assets/logo-ritmoderever.png" alt="${BRAND} Logo" class="img-fluid mb-3" style="max-height: 60px;">
+              <h2 class="card-title h4 mb-3 text-dark">Error al generar certificado</h2>
+              <p class="card-text text-secondary">Ocurrió un error inesperado. Detalles: ${e?.message || e}</p>
+              <a href="/" class="btn btn-dark mt-3">Volver al inicio</a>
+          </div>
+          <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
+      </body>
+      </html>
+    `);
   }
 });
 
-// ---------- Link directo ----------
-app.get('/order-pdf', async (req, res) => {
-  try {
-    const session = await getOrInstallOfflineSession(req, res);
-    if (!session) return;
-
-    const titular = String(req.query?.titular || '').trim();
-    const orderName = String(req.query?.order_name || '').trim();
-    const orderId = String(req.query?.order_id || '').trim() || null;
-    if (!orderName && !orderId) return res.status(400).send('Falta order_name u order_id');
-    if (!titular) return res.status(400).send('Falta titular');
-
-    const order = await fetchOrderWithImages(session, { orderId, orderName });
-
-    const safeName = String(order.name || 'orden').replace(/[^a-z0-9]+/gi, '-');
-    const fname = `Certificados-${safeName}.pdf`;
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
-
-    const doc = new PDFDocument({ size: 'A4', margin: 50 });
-    doc.pipe(res);
-
-    let first = true;
-    for (const edge of (order.lineItems?.edges || [])) {
-      const li = edge.node;
-      const img = li?.variant?.image?.url || li?.variant?.product?.featuredImage?.url || null;
-      const qty = Math.max(1, Number(li.quantity || 1));
-      for (let i = 1; i <= qty; i++) {
-        const code = genCode({ orderId: order.id, lineItemId: li.id, unitIndex: i });
-        if (!first) doc.addPage();
-        await drawCertPage({
-          doc,
-          brand: BRAND,
-          orderName: order.name,
-          code,
-          title: li.title,
-          sku: li.sku || '',
-          unitIndex: i,
-          titular,
-          imageUrl: img,
-        });
-        first = false;
-      }
-    }
-    doc.end();
-  } catch (e) {
-    console.error('[GET /order-pdf] error:', e);
-    res.status(e.status || 500).send('Error: ' + (e?.message || e));
-  }
-});
-
-// ---------- Diag ----------
-app.get('/diag', (_req, res) => {
-  res.json({
-    host: APP_HOST_RAW || null,
-    hostName: HOST_NAME,
-    hasKey: !!process.env.SHOPIFY_API_KEY,
-    hasSecret: !!process.env.SHOPIFY_API_SECRET,
-    scopes: SCOPES,
-    defaultShop: DEFAULT_SHOP,
-    dbPath: DB_PATH,
-  });
-});
-
-// ---------- Start ----------
 app.get('/healthz', (_req, res) => res.send('ok'));
-app.listen(PORT, () => console.log(`✅ Certificados app en ${HOST_SCHEME}://${HOST_NAME || 'localhost'}:${HOST_NAME ? '' : PORT}`));
+
+app.listen(PORT, () => console.log(`✅ App certificados escuchando en http://localhost:${PORT}`));
