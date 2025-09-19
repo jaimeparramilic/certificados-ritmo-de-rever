@@ -12,10 +12,10 @@ dotenv.config({ path: path.join(process.cwd(), '.env') });
 
 // ---------- CONFIG ----------
 const PORT = Number(process.env.PORT || 3001);
-const BRAND = process.env.BRAND_NAME || 'RITMODEREVER';
-const DEFAULT_SHOP = process.env.DEFAULT_SHOP || '';
-const APP_PRINCIPAL_URL = process.env.SHOPIFY_APP_URL;
-const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
+const BRAND = 'RITMODEREVER';
+const DEFAULT_SHOP = 'kueh0y-ib.myshopify.com';
+const APP_PRINCIPAL_URL = "https://shopify-app-10289619147.us-central1.run.app";
+const INTERNAL_API_KEY = "k3y_Int3rn4_p4rA_Wh4ts4pp_y_Sh0p1fy_7zK9bV";
 
 if (!APP_PRINCIPAL_URL) throw new Error('Debe definir SHOPIFY_APP_URL en .env');
 if (!INTERNAL_API_KEY) throw new Error('Debe definir INTERNAL_API_KEY en .env');
@@ -108,8 +108,6 @@ async function drawCertPage({ doc, titular, order }) {
         
         const dimensions = sizeOf(imgBuf);
         
-        // --- SALVAGUARDA CONTRA ERRORES ---
-        // Se comprueba que las dimensiones sean válidas antes de calcular.
         if (dimensions && dimensions.width && dimensions.height > 0) {
             const scaledWidth = dimensions.width * (fixedHeight / dimensions.height);
             const xPos = (doc.page.width - scaledWidth) / 2;
@@ -124,7 +122,7 @@ async function drawCertPage({ doc, titular, order }) {
         doc.y = imageY;
         console.warn('Error al dibujar la imagen:', e.message);
         doc.fontSize(10).fillColor('#e74c3c').text('Error al cargar la imagen del producto.', { align: 'center' });
-        doc.y += 20; // Añade espacio para que el error sea visible.
+        doc.y += 20;
       }
     } else {
         doc.fontSize(10).fillColor('#e74c3c').text('No se pudo cargar el buffer de la imagen.', { align: 'center' });
